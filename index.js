@@ -146,8 +146,13 @@ app.post('/api/auth/verify', async (req, res) => {
       next: 'POST /api/auth/claim-id with { user_id, will_id }'
     });
   } catch (err) {
-    res.status(500).json({ status: 'error', message: err.message });
-  }
+res.status(500).json({
+  status: 'error',
+  message: err.message,
+  details: err.details || null,
+  hint: err.hint || null,
+  code: err.code || null
+});
 });
 
 // STEP 3: Claim Will ID
