@@ -43,11 +43,11 @@ app.get('/api/db-test', async (req, res) => {
 });
 
 app.get('/terms', (req, res) => {
-  res.send('WETIN Terms of Service — https://wetin-backend.onrender.com/terms');
+  res.send('WETIN Terms of Service - https://wetin-backend.onrender.com/terms');
 });
 
 app.get('/privacy', (req, res) => {
-  res.send('WETIN Privacy Policy — https://wetin-backend.onrender.com/privacy');
+  res.send('WETIN Privacy Policy - https://wetin-backend.onrender.com/privacy');
 });
 
 app.post('/api/auth/start', async (req, res) => {
@@ -78,24 +78,31 @@ app.post('/api/auth/start', async (req, res) => {
       expires_at
     });
 
+    let emailError = null;
     try {
-      await resend.emails.send({
+      const emailResult = await resend.emails.send({
         from: process.env.RESEND_FROM || 'onboarding@resend.dev',
         to: email,
         subject: 'Your WETIN verification code',
-        html: `<div style="font-family:sans-serif;padding:24px;background:#0A0A0A;color:#F5F5F5;">
-          <h1 style="color:#C6FF00;">WETIN</h1>
-          <p>Your verification code is:</p>
-          <h2 style="color:#C6FF00;font-size:32px;letter-spacing:4px;">${otp}</h2>
-          <p>This code expires in 10 minutes. Do not share it with anyone.</p>
-          <p style="color:#888;font-size:12px;">If you didn't request this, ignore this email.</p>
-        </div>`
+        html: '<div style="font-family:sans-serif;padding:24px;background:#0A0A0A;color:#F5F5F5;">' +
+              '<h1 style="color:#C6FF00;">WETIN</h1>' +
+              '<p>Your verification code is:</p>' +
+              '<h2 style="color:#C6FF00;font-size:32px;letter-spacing:4px;">' + otp + '</h2>' +
+              '<p>This code expires in 10 minutes. Do not share it with anyone.</p>' +
+              '</div>'
       });
+      console.log('Resend success:', JSON.stringify(emailResult));
     } catch (emailErr) {
-      console.log('Email send error:', emailErr);
+      console.log('Resend error:', JSON.stringify(emailErr));
+      emailError = emailErr.message || String(emailErr);
     }
 
-    res.json({ status: 'ok', message: 'Verification code sent to email', next: 'POST /api/auth/verify' });
+    res.json({
+      status: 'ok',
+      message: emailError ? 'OTP generated but email failed' : 'Verification code sent to email',
+      email_error: emailError,
+      next: 'POST /api/auth/verify'
+    });
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message, details: err.details || null });
   }
@@ -138,9 +145,9 @@ app.post('/api/auth/verify', async (req, res) => {
     const { data: newUser, error: createErr } = await supabase
       .from('users')
       .insert({
-        will_id,
-        phone_hash,
-        email_hash,
+        will_id: will_id,
+        phone_hash: phone_hash,
+        email_hash: email_hash,
         phone_verified: true,
         email_verified: true,
         mode: 'ghost',
@@ -186,7 +193,7 @@ app.post('/api/auth/claim-id', async (req, res) => {
 
     const { data: updated, error: updateErr } = await supabase
       .from('users')
-      .update({ will_id, will_id_locked: true, signup_completed: true })
+      .update({ will_id: will_id, will_id_locked: true, signup_completed: true })
       .eq('id', user_id)
       .select('id, will_id, mode, created_at')
       .single();
