@@ -26,15 +26,12 @@ function generateOtp() {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
-function generateVideoHash(input) {
-  return crypto.createHash('sha256').update(input).digest('hex').substring(0, 32);
-}
-
 function formatUserForViewer(user) {
-  if (!user) return null;
+  if (!user) return { anonymous: true, display: 'Someone' };
   if (user.mode === 'ghost') return { anonymous: true, display: 'Someone' };
   if (user.mode === 'shadow') return { anonymous: false, will_id: user.will_id, display: user.display_name };
   if (user.mode === 'open') return { anonymous: false, will_id: user.will_id, display: user.real_name, verified: true };
+  return { anonymous: true, display: 'Someone' };
 }
 
 app.get('/api/health', (req, res) => {
@@ -68,9 +65,7 @@ app.post('/api/auth/start', async (req, res) => {
     if (phoneExists) return res.status(400).json({ status: 'error', message: 'Phone already registered' });
 
     const { count: emailCount } = await supabase.from('users').select('*', { count: 'exact', head: true }).eq('email_hash', email_hash);
-    if (emailCount >= 4) {
-      return res.json({ status: 'limit_reached', message: 'Max 4 accounts per email', upgrade_available: true });
-    }
+    if (emailCount >= 4) return res.json({ status: 'limit_reached', message: 'Max 4 accounts per email', upgrade_available: true });
 
     const otp = generateOtp();
     const expires_at = new Date(Date.now() + 10 * 60 * 1000).toISOString();
@@ -104,7 +99,6 @@ app.post('/api/auth/verify', async (req, res) => {
     const email_hash = hashValue(email);
 
     const { data: otpRecord } = await supabase.from('otp_codes').select('*').eq('email_hash', email_hash).eq('code', otp_code).eq('used', false).gte('expires_at', new Date().toISOString()).order('created_at', { ascending: false }).limit(1).maybeSingle();
-
     if (!otpRecord) return res.status(400).json({ status: 'error', message: 'Invalid or expired OTP' });
 
     await supabase.from('otp_codes').update({ used: true }).eq('id', otpRecord.id);
@@ -141,8 +135,8 @@ app.post('/api/auth/claim-id', async (req, res) => {
     if (clash) return res.status(400).json({ status: 'error', message: 'Will ID taken' });
 
     const { data: updated, error: updateErr } = await supabase.from('users').update({ will_id, will_id_locked: true, signup_completed: true }).eq('id', user_id).select('id, will_id, mode, created_at').single();
-
     if (updateErr) throw updateErr;
+
     res.json({ status: 'ok', message: 'Welcome to WETIN', user: updated });
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message });
@@ -251,12 +245,8 @@ app.post('/api/videos', async (req, res) => {
     if (!user) return res.status(404).json({ status: 'error', message: 'User not found' });
     if (user.account_status !== 'active') return res.status(403).json({ status: 'error', message: 'Account is not active' });
 
-    if (content_type === 'short' && duration_seconds > 60) {
-      return res.status(400).json({ status: 'error', message: 'Short videos must be 60 seconds or less' });
-    }
-    if (content_type === 'long' && duration_seconds > 1500) {
-      return res.status(400).json({ status: 'error', message: 'Long videos must be 25 minutes or less' });
-    }
+    if (content_type === 'short' && duration_seconds > 60) return res.status(400).json({ status: 'error', message: 'Short videos must be 60 seconds or less' });
+    if (content_type === 'long' && duration_seconds > 1500) return res.status(400).json({ status: 'error', message: 'Long videos must be 25 minutes or less' });
 
     if (video_hash) {
       const { data: existingVideo } = await supabase.from('videos').select('id').eq('video_hash', video_hash).maybeSingle();
@@ -269,9 +259,7 @@ app.post('/api/videos', async (req, res) => {
       if (!parent.allow_duets) return res.status(403).json({ status: 'error', message: 'Duets are not allowed on this video' });
 
       const { data: approval } = await supabase.from('duet_requests').select('status').eq('requester_id', user_id).eq('original_video_id', parent_video_id).maybeSingle();
-      if (!approval || approval.status !== 'approved') {
-        return res.status(403).json({ status: 'error', message: 'You need approval from the original creator' });
-      }
+      if (!approval || approval.status !== 'approved') return res.status(403).json({ status: 'error', message: 'You need approval from the original creator' });
     }
 
     const { data: newVideo, error: insertErr } = await supabase.from('videos').insert({
@@ -282,7 +270,6 @@ app.post('/api/videos', async (req, res) => {
     }).select('id, created_at').single();
 
     if (insertErr) throw insertErr;
-
     res.status(201).json({ status: 'ok', message: 'Video posted', video: newVideo });
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message, details: err.details || null });
@@ -295,10 +282,7 @@ app.get('/api/videos/feed', async (req, res) => {
     const contentType = req.query.type || 'short';
 
     let query = supabase.from('videos').select('id, user_id, video_url, thumbnail_url, caption, duration_sec, orientation, content_type, is_duet, parent_video_id, resonance_count, comment_count, created_at').eq('is_removed', false).eq('is_frozen', false).eq('moderation_flag', 'clean').order('created_at', { ascending: false }).limit(limit);
-
-    if (contentType !== 'all') {
-      query = query.eq('content_type', contentType);
-    }
+    if (contentType !== 'all') query = query.eq('content_type', contentType);
 
     const { data: videos, error } = await query;
     if (error) throw error;
@@ -328,11 +312,116 @@ app.get('/api/videos/:id', async (req, res) => {
   }
 });
 
+app.get('/api/videos/:id/stats', async (req, res) => {
+  try {
+    const { data: video } = await supabase.from('videos').select('id, resonance_count, comment_count').eq('id', req.params.id).maybeSingle();
+    if (!video) return res.status(404).json({ status: 'error', message: 'Video not found' });
+    res.json({ status: 'ok', stats: { resonance: video.resonance_count || 0, comments: video.comment_count || 0 } });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.post('/api/comments', async (req, res) => {
+  try {
+    const { user_id, video_id, content, parent_id } = req.body;
+    if (!user_id || !video_id || !content) return res.status(400).json({ status: 'error', message: 'user_id, video_id, content required' });
+    if (content.length > 500) return res.status(400).json({ status: 'error', message: 'Comment too long (max 500 chars)' });
+
+    const { data: user } = await supabase.from('users').select('account_status').eq('id', user_id).maybeSingle();
+    if (!user) return res.status(404).json({ status: 'error', message: 'User not found' });
+    if (user.account_status !== 'active') return res.status(403).json({ status: 'error', message: 'Account is not active' });
+
+    const { data: video } = await supabase.from('videos').select('id, comment_count').eq('id', video_id).maybeSingle();
+    if (!video) return res.status(404).json({ status: 'error', message: 'Video not found' });
+
+    const { data: comment, error } = await supabase.from('comments').insert({ user_id, video_id, content, parent_id: parent_id || null }).select('id, created_at').single();
+    if (error) throw error;
+
+    await supabase.from('videos').update({ comment_count: (video.comment_count || 0) + 1 }).eq('id', video_id);
+
+    res.status(201).json({ status: 'ok', message: 'Comment posted', comment });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.get('/api/comments/:video_id', async (req, res) => {
+  try {
+    const { data: comments, error } = await supabase.from('comments').select('id, user_id, content, parent_id, created_at').eq('video_id', req.params.video_id).eq('is_removed', false).eq('is_frozen', false).order('created_at', { ascending: false }).limit(100);
+    if (error) throw error;
+
+    const formatted = [];
+    for (const comment of comments) {
+      const { data: user } = await supabase.from('users').select('id, will_id, mode, display_name, real_name').eq('id', comment.user_id).maybeSingle();
+      formatted.push({ ...comment, author: formatUserForViewer(user) });
+    }
+
+    res.json({ status: 'ok', count: formatted.length, comments: formatted });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.delete('/api/comments/:id', async (req, res) => {
+  try {
+    const { user_id } = req.body;
+    if (!user_id) return res.status(400).json({ status: 'error', message: 'user_id required' });
+
+    const { data: comment } = await supabase.from('comments').select('user_id, video_id').eq('id', req.params.id).maybeSingle();
+    if (!comment) return res.status(404).json({ status: 'error', message: 'Comment not found' });
+    if (comment.user_id !== user_id) return res.status(403).json({ status: 'error', message: 'Not your comment' });
+
+    await supabase.from('comments').update({ is_removed: true }).eq('id', req.params.id);
+    res.json({ status: 'ok', message: 'Comment deleted' });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.post('/api/resonance', async (req, res) => {
+  try {
+    const { user_id, video_id } = req.body;
+    if (!user_id || !video_id) return res.status(400).json({ status: 'error', message: 'user_id and video_id required' });
+
+    const { data: user } = await supabase.from('users').select('account_status').eq('id', user_id).maybeSingle();
+    if (!user) return res.status(404).json({ status: 'error', message: 'User not found' });
+    if (user.account_status !== 'active') return res.status(403).json({ status: 'error', message: 'Account is not active' });
+
+    const { data: video } = await supabase.from('videos').select('id, user_id, resonance_count').eq('id', video_id).maybeSingle();
+    if (!video) return res.status(404).json({ status: 'error', message: 'Video not found' });
+
+    const { data: existing } = await supabase.from('resonance').select('id').eq('user_id', user_id).eq('video_id', video_id).maybeSingle();
+
+    if (existing) {
+      await supabase.from('resonance').delete().eq('id', existing.id);
+      const newCount = Math.max(0, (video.resonance_count || 0) - 1);
+      await supabase.from('videos').update({ resonance_count: newCount }).eq('id', video_id);
+      return res.json({ status: 'ok', action: 'unliked', resonance_count: newCount });
+    } else {
+      await supabase.from('resonance').insert({ user_id, video_id });
+      const newCount = (video.resonance_count || 0) + 1;
+      await supabase.from('videos').update({ resonance_count: newCount }).eq('id', video_id);
+      return res.json({ status: 'ok', action: 'liked', resonance_count: newCount });
+    }
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.get('/api/resonance/:video_id/:user_id', async (req, res) => {
+  try {
+    const { data } = await supabase.from('resonance').select('id').eq('user_id', req.params.user_id).eq('video_id', req.params.video_id).maybeSingle();
+    res.json({ status: 'ok', has_resonated: !!data });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
 app.post('/api/videos/:id/allow-duets', async (req, res) => {
   try {
     const { user_id, allow } = req.body;
     const video_id = req.params.id;
-
     if (!user_id || typeof allow !== 'boolean') return res.status(400).json({ status: 'error', message: 'user_id and allow (boolean) required' });
 
     const { data: video } = await supabase.from('videos').select('user_id').eq('id', video_id).maybeSingle();
@@ -360,7 +449,6 @@ app.post('/api/duet/request', async (req, res) => {
     if (existing) return res.status(400).json({ status: 'error', message: 'Request already exists', current_status: existing.status });
 
     const expires_at = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
-
     const { data: request, error } = await supabase.from('duet_requests').insert({ requester_id, original_video_id, original_creator_id: video.user_id, message: message || null, expires_at }).select('id, created_at, expires_at').single();
 
     if (error) throw error;
