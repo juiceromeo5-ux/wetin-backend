@@ -248,26 +248,14 @@ app.post('/api/upload/sign', async (req, res) => {
     if (!user_id) return res.status(400).json({ status: 'error', message: 'user_id required' });
 
     const { data: user } = await supabase.from('users').select('account_status').eq('id', user_id).maybeSingle();
-    if (!user || user.account_status !== 'active') {
-      return res.status(403).json({ status: 'error', message: 'Account is not active' });
-    }
+    if (!user || user.account_status !== 'active') return res.status(403).json({ status: 'error', message: 'Account is not active' });
 
     const timestamp = Math.round(Date.now() / 1000);
     const folder = content_type === 'long' ? 'wetin/long' : 'wetin/short';
 
-    const signature = cloudinary.utils.api_sign_request(
-      { timestamp, folder },
-      process.env.CLOUDINARY_API_SECRET
-    );
+    const signature = cloudinary.utils.api_sign_request({ timestamp, folder }, process.env.CLOUDINARY_API_SECRET);
 
-    res.json({
-      status: 'ok',
-      upload_url: 'https://api.cloudinary.com/v1_1/' + process.env.CLOUDINARY_CLOUD_NAME + '/video/upload',
-      signature,
-      timestamp,
-      folder,
-      api_key: process.env.CLOUDINARY_API_KEY
-    });
+    res.json({ status: 'ok', upload_url: 'https://api.cloudinary.com/v1_1/' + process.env.CLOUDINARY_CLOUD_NAME + '/video/upload', signature, timestamp, folder, api_key: process.env.CLOUDINARY_API_KEY });
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message });
   }
@@ -276,7 +264,6 @@ app.post('/api/upload/sign', async (req, res) => {
 app.post('/api/videos', async (req, res) => {
   try {
     const { user_id, video_url, thumbnail_url, caption, duration_seconds, aspect_ratio, orientation, content_type, video_hash, is_duet, parent_video_id } = req.body;
-
     if (!user_id || !video_url) return res.status(400).json({ status: 'error', message: 'user_id and video_url required' });
 
     const { data: user } = await supabase.from('users').select('account_status').eq('id', user_id).maybeSingle();
@@ -451,6 +438,86 @@ app.get('/api/resonance/:video_id/:user_id', async (req, res) => {
   try {
     const { data } = await supabase.from('resonance').select('id').eq('user_id', req.params.user_id).eq('video_id', req.params.video_id).maybeSingle();
     res.json({ status: 'ok', has_resonated: !!data });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.post('/api/follow', async (req, res) => {
+  try {
+    const { follower_id, following_id } = req.body;
+    if (!follower_id || !following_id) return res.status(400).json({ status: 'error', message: 'follower_id and following_id required' });
+    if (follower_id === following_id) return res.status(400).json({ status: 'error', message: 'Cannot follow yourself' });
+
+    const { data: userA } = await supabase.from('users').select('id, account_status').eq('id', follower_id).maybeSingle();
+    if (!userA || userA.account_status !== 'active') return res.status(403).json({ status: 'error', message: 'Your account is not active' });
+
+    const { data: userB } = await supabase.from('users').select('id, account_status').eq('id', following_id).maybeSingle();
+    if (!userB) return res.status(404).json({ status: 'error', message: 'User not found' });
+
+    const { data: existing } = await supabase.from('follows').select('id').eq('follower_id', follower_id).eq('following_id', following_id).maybeSingle();
+
+    if (existing) {
+      await supabase.from('follows').delete().eq('id', existing.id);
+      return res.json({ status: 'ok', action: 'unfollowed' });
+    } else {
+      await supabase.from('follows').insert({ follower_id, following_id });
+      return res.json({ status: 'ok', action: 'followed' });
+    }
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.get('/api/follow/followers/:user_id', async (req, res) => {
+  try {
+    const { data: follows, error } = await supabase.from('follows').select('follower_id, created_at').eq('following_id', req.params.user_id).order('created_at', { ascending: false }).limit(200);
+    if (error) throw error;
+
+    const formatted = [];
+    for (const f of follows) {
+      const { data: user } = await supabase.from('users').select('id, will_id, mode, display_name, real_name').eq('id', f.follower_id).maybeSingle();
+      formatted.push({ followed_at: f.created_at, user: formatUserForViewer(user) });
+    }
+
+    res.json({ status: 'ok', count: formatted.length, followers: formatted });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.get('/api/follow/following/:user_id', async (req, res) => {
+  try {
+    const { data: follows, error } = await supabase.from('follows').select('following_id, created_at').eq('follower_id', req.params.user_id).order('created_at', { ascending: false }).limit(200);
+    if (error) throw error;
+
+    const formatted = [];
+    for (const f of follows) {
+      const { data: user } = await supabase.from('users').select('id, will_id, mode, display_name, real_name').eq('id', f.following_id).maybeSingle();
+      formatted.push({ followed_at: f.created_at, user: formatUserForViewer(user) });
+    }
+
+    res.json({ status: 'ok', count: formatted.length, following: formatted });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.get('/api/follow/stats/:user_id', async (req, res) => {
+  try {
+    const { count: followersCount } = await supabase.from('follows').select('*', { count: 'exact', head: true }).eq('following_id', req.params.user_id);
+    const { count: followingCount } = await supabase.from('follows').select('*', { count: 'exact', head: true }).eq('follower_id', req.params.user_id);
+
+    res.json({ status: 'ok', followers: followersCount || 0, following: followingCount || 0 });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.get('/api/follow/check/:follower_id/:following_id', async (req, res) => {
+  try {
+    const { data } = await supabase.from('follows').select('id').eq('follower_id', req.params.follower_id).eq('following_id', req.params.following_id).maybeSingle();
+    res.json({ status: 'ok', is_following: !!data });
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message });
   }
