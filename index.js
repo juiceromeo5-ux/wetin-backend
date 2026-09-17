@@ -2,6 +2,7 @@ const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const crypto = require('crypto');
 const { Resend } = require('resend');
+const cloudinary = require('cloudinary').v2;
 
 const app = express();
 app.use(express.json());
@@ -12,6 +13,12 @@ const supabase = createClient(
 );
 
 const resend = new Resend(process.env.RESEND_API_KEY);
+
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET
+});
 
 function hashValue(value) {
   return crypto.createHash('sha256').update(value).digest('hex');
@@ -230,6 +237,37 @@ app.post('/api/admin/panic/review', async (req, res) => {
 
     await supabase.from('panic_reports').update({ status: 'resolved', resolved_at: new Date().toISOString() }).eq('target_user_id', user_id).eq('status', 'open');
     res.json({ status: 'ok', message: 'Decision applied: ' + decision });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.post('/api/upload/sign', async (req, res) => {
+  try {
+    const { user_id, content_type } = req.body;
+    if (!user_id) return res.status(400).json({ status: 'error', message: 'user_id required' });
+
+    const { data: user } = await supabase.from('users').select('account_status').eq('id', user_id).maybeSingle();
+    if (!user || user.account_status !== 'active') {
+      return res.status(403).json({ status: 'error', message: 'Account is not active' });
+    }
+
+    const timestamp = Math.round(Date.now() / 1000);
+    const folder = content_type === 'long' ? 'wetin/long' : 'wetin/short';
+
+    const signature = cloudinary.utils.api_sign_request(
+      { timestamp, folder },
+      process.env.CLOUDINARY_API_SECRET
+    );
+
+    res.json({
+      status: 'ok',
+      upload_url: 'https://api.cloudinary.com/v1_1/' + process.env.CLOUDINARY_CLOUD_NAME + '/video/upload',
+      signature,
+      timestamp,
+      folder,
+      api_key: process.env.CLOUDINARY_API_KEY
+    });
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message });
   }
