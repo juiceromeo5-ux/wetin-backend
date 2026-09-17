@@ -26,7 +26,12 @@ function generateOtp() {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
+function generateVideoHash(input) {
+  return crypto.createHash('sha256').update(input).digest('hex').substring(0, 32);
+}
+
 function formatUserForViewer(user) {
+  if (!user) return null;
   if (user.mode === 'ghost') return { anonymous: true, display: 'Someone' };
   if (user.mode === 'shadow') return { anonymous: false, will_id: user.will_id, display: user.display_name };
   if (user.mode === 'open') return { anonymous: false, will_id: user.will_id, display: user.real_name, verified: true };
@@ -38,7 +43,7 @@ app.get('/api/health', (req, res) => {
 
 app.get('/api/db-test', async (req, res) => {
   const { count, error } = await supabase.from('users').select('*', { count: 'exact', head: true });
-  if (error) return res.status(500).json({ status: 'error', message: error.message, details: error.details });
+  if (error) return res.status(500).json({ status: 'error', message: error.message });
   res.json({ status: 'ok', message: 'Supabase connected', userCount: count });
 });
 
@@ -70,13 +75,7 @@ app.post('/api/auth/start', async (req, res) => {
     const otp = generateOtp();
     const expires_at = new Date(Date.now() + 10 * 60 * 1000).toISOString();
 
-    await supabase.from('otp_codes').insert({
-      email_hash,
-      phone_hash,
-      code: otp,
-      purpose: 'signup',
-      expires_at
-    });
+    await supabase.from('otp_codes').insert({ email_hash, phone_hash, code: otp, purpose: 'signup', expires_at });
 
     let emailError = null;
     try {
@@ -84,25 +83,15 @@ app.post('/api/auth/start', async (req, res) => {
         from: process.env.RESEND_FROM || 'onboarding@resend.dev',
         to: email,
         subject: 'Your WETIN verification code',
-        html: '<div style="font-family:sans-serif;padding:24px;background:#0A0A0A;color:#F5F5F5;">' +
-              '<h1 style="color:#C6FF00;">WETIN</h1>' +
-              '<p>Your verification code is:</p>' +
-              '<h2 style="color:#C6FF00;font-size:32px;letter-spacing:4px;">' + otp + '</h2>' +
-              '<p>This code expires in 10 minutes. Do not share it with anyone.</p>' +
-              '</div>'
+        html: '<div style="font-family:sans-serif;padding:24px;background:#0A0A0A;color:#F5F5F5;"><h1 style="color:#C6FF00;">WETIN</h1><p>Your verification code is:</p><h2 style="color:#C6FF00;font-size:32px;letter-spacing:4px;">' + otp + '</h2><p>This code expires in 10 minutes.</p></div>'
       });
     } catch (emailErr) {
       emailError = emailErr.message || String(emailErr);
     }
 
-    res.json({
-      status: 'ok',
-      message: emailError ? 'OTP generated but email failed' : 'Verification code sent to email',
-      email_error: emailError,
-      next: 'POST /api/auth/verify'
-    });
+    res.json({ status: 'ok', message: emailError ? 'OTP generated but email failed' : 'Verification code sent to email', email_error: emailError, next: 'POST /api/auth/verify' });
   } catch (err) {
-    res.status(500).json({ status: 'error', message: err.message, details: err.details || null });
+    res.status(500).json({ status: 'error', message: err.message });
   }
 });
 
@@ -114,20 +103,9 @@ app.post('/api/auth/verify', async (req, res) => {
     const phone_hash = hashValue(phone);
     const email_hash = hashValue(email);
 
-    const { data: otpRecord } = await supabase
-      .from('otp_codes')
-      .select('*')
-      .eq('email_hash', email_hash)
-      .eq('code', otp_code)
-      .eq('used', false)
-      .gte('expires_at', new Date().toISOString())
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
+    const { data: otpRecord } = await supabase.from('otp_codes').select('*').eq('email_hash', email_hash).eq('code', otp_code).eq('used', false).gte('expires_at', new Date().toISOString()).order('created_at', { ascending: false }).limit(1).maybeSingle();
 
-    if (!otpRecord) {
-      return res.status(400).json({ status: 'error', message: 'Invalid or expired OTP' });
-    }
+    if (!otpRecord) return res.status(400).json({ status: 'error', message: 'Invalid or expired OTP' });
 
     await supabase.from('otp_codes').update({ used: true }).eq('id', otpRecord.id);
 
@@ -140,45 +118,17 @@ app.post('/api/auth/verify', async (req, res) => {
       attempts++;
     }
 
-    const { data: newUser, error: createErr } = await supabase
-      .from('users')
-      .insert({
-        will_id,
-        phone_hash,
-        email_hash,
-        phone_verified: true,
-        email_verified: true,
-        mode: 'ghost',
-        kyc_verified: false,
-        signup_completed: false,
-        will_id_locked: false,
-        terms_accepted: true,
-        terms_accepted_at: new Date().toISOString(),
-        privacy_accepted: true,
-        privacy_accepted_at: new Date().toISOString(),
-        subscription_tier: 'free',
-        account_status: 'active'
-      })
-      .select('id, will_id')
-      .single();
+    const { data: newUser, error: createErr } = await supabase.from('users').insert({
+      will_id, phone_hash, email_hash, phone_verified: true, email_verified: true, mode: 'ghost', kyc_verified: false,
+      signup_completed: false, will_id_locked: false, terms_accepted: true, terms_accepted_at: new Date().toISOString(),
+      privacy_accepted: true, privacy_accepted_at: new Date().toISOString(), subscription_tier: 'free', account_status: 'active'
+    }).select('id, will_id').single();
 
     if (createErr) throw createErr;
 
-    res.status(201).json({
-      status: 'ok',
-      message: 'Verified! Your anonymous ID is ready.',
-      user_id: newUser.id,
-      default_will_id: newUser.will_id,
-      next: 'POST /api/auth/claim-id'
-    });
+    res.status(201).json({ status: 'ok', message: 'Verified! Your anonymous ID is ready.', user_id: newUser.id, default_will_id: newUser.will_id, next: 'POST /api/auth/claim-id' });
   } catch (err) {
-    res.status(500).json({
-      status: 'error',
-      message: err.message,
-      details: err.details || null,
-      hint: err.hint || null,
-      code: err.code || null
-    });
+    res.status(500).json({ status: 'error', message: err.message, details: err.details || null });
   }
 });
 
@@ -190,158 +140,60 @@ app.post('/api/auth/claim-id', async (req, res) => {
     const { data: clash } = await supabase.from('users').select('id').eq('will_id', will_id).maybeSingle();
     if (clash) return res.status(400).json({ status: 'error', message: 'Will ID taken' });
 
-    const { data: updated, error: updateErr } = await supabase
-      .from('users')
-      .update({ will_id, will_id_locked: true, signup_completed: true })
-      .eq('id', user_id)
-      .select('id, will_id, mode, created_at')
-      .single();
+    const { data: updated, error: updateErr } = await supabase.from('users').update({ will_id, will_id_locked: true, signup_completed: true }).eq('id', user_id).select('id, will_id, mode, created_at').single();
 
     if (updateErr) throw updateErr;
-
     res.json({ status: 'ok', message: 'Welcome to WETIN', user: updated });
   } catch (err) {
-    res.status(500).json({
-      status: 'error',
-      message: err.message,
-      details: err.details || null,
-      hint: err.hint || null,
-      code: err.code || null
-    });
+    res.status(500).json({ status: 'error', message: err.message });
   }
 });
 
 app.post('/api/panic/report', async (req, res) => {
   try {
     const { reporter_id, target_type, target_id, target_user_id, context, notes } = req.body;
+    if (!reporter_id || !target_type || !target_id) return res.status(400).json({ status: 'error', message: 'reporter_id, target_type, target_id required' });
 
-    if (!reporter_id || !target_type || !target_id) {
-      return res.status(400).json({ status: 'error', message: 'reporter_id, target_type, target_id required' });
-    }
+    const { data: existing } = await supabase.from('panic_reports').select('id').eq('reporter_id', reporter_id).eq('target_type', target_type).eq('target_id', target_id).maybeSingle();
+    if (existing) return res.status(400).json({ status: 'error', message: 'You already reported this' });
 
-    const { data: existing } = await supabase
-      .from('panic_reports')
-      .select('id')
-      .eq('reporter_id', reporter_id)
-      .eq('target_type', target_type)
-      .eq('target_id', target_id)
-      .maybeSingle();
+    await supabase.from('panic_reports').insert({ reporter_id, target_type, target_id, target_user_id, context, notes, status: 'open' });
 
-    if (existing) {
-      return res.status(400).json({ status: 'error', message: 'You already reported this' });
-    }
-
-    const { error: insertErr } = await supabase.from('panic_reports').insert({
-      reporter_id,
-      target_type,
-      target_id,
-      target_user_id,
-      context,
-      notes,
-      status: 'open'
-    });
-
-    if (insertErr) throw insertErr;
-
-    const { count: reportCount } = await supabase
-      .from('panic_reports')
-      .select('*', { count: 'exact', head: true })
-      .eq('target_type', target_type)
-      .eq('target_id', target_id);
-
+    const { count: reportCount } = await supabase.from('panic_reports').select('*', { count: 'exact', head: true }).eq('target_type', target_type).eq('target_id', target_id);
     const threshold = target_type === 'chat' ? 1 : 5;
     const shouldFreeze = reportCount >= threshold;
 
-    const { data: freeze } = await supabase
-      .from('freeze_status')
-      .select('*')
-      .eq('target_type', target_type)
-      .eq('target_id', target_id)
-      .maybeSingle();
+    const { data: freeze } = await supabase.from('freeze_status').select('*').eq('target_type', target_type).eq('target_id', target_id).maybeSingle();
 
     if (!freeze) {
-      await supabase.from('freeze_status').insert({
-        target_type,
-        target_id,
-        target_user_id,
-        report_count: reportCount,
-        is_frozen: shouldFreeze,
-        frozen_at: shouldFreeze ? new Date().toISOString() : null,
-        suspend_deadline: shouldFreeze ? new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString() : null
-      });
+      await supabase.from('freeze_status').insert({ target_type, target_id, target_user_id, report_count: reportCount, is_frozen: shouldFreeze, frozen_at: shouldFreeze ? new Date().toISOString() : null, suspend_deadline: shouldFreeze ? new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString() : null });
     } else {
-      await supabase.from('freeze_status').update({
-        report_count: reportCount,
-        is_frozen: shouldFreeze || freeze.is_frozen,
-        frozen_at: shouldFreeze && !freeze.frozen_at ? new Date().toISOString() : freeze.frozen_at,
-        suspend_deadline: shouldFreeze && !freeze.suspend_deadline ? new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString() : freeze.suspend_deadline
-      }).eq('id', freeze.id);
+      await supabase.from('freeze_status').update({ report_count: reportCount, is_frozen: shouldFreeze || freeze.is_frozen }).eq('id', freeze.id);
     }
 
     if (shouldFreeze && target_user_id) {
-      await supabase.from('users').update({
-        account_status: 'suspended',
-        suspended_at: new Date().toISOString(),
-        ban_deadline: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString()
-      }).eq('id', target_user_id);
+      await supabase.from('users').update({ account_status: 'suspended', suspended_at: new Date().toISOString(), ban_deadline: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString() }).eq('id', target_user_id);
     }
 
-    res.json({
-      status: 'ok',
-      message: shouldFreeze ? 'Report received. Account suspended for review.' : 'Report received. Under review.',
-      report_count: reportCount,
-      threshold,
-      frozen: shouldFreeze,
-      remaining_reports_needed: Math.max(0, threshold - reportCount)
-    });
+    res.json({ status: 'ok', message: shouldFreeze ? 'Account suspended for review.' : 'Report received. Under review.', report_count: reportCount, threshold, frozen: shouldFreeze, remaining_reports_needed: Math.max(0, threshold - reportCount) });
   } catch (err) {
-    res.status(500).json({ status: 'error', message: err.message, details: err.details || null });
+    res.status(500).json({ status: 'error', message: err.message });
   }
 });
 
 app.post('/api/panic/appeal', async (req, res) => {
   try {
     const { user_id, appeal_text } = req.body;
+    if (!user_id || !appeal_text) return res.status(400).json({ status: 'error', message: 'user_id and appeal_text required' });
 
-    if (!user_id || !appeal_text) {
-      return res.status(400).json({ status: 'error', message: 'user_id and appeal_text required' });
-    }
-
-    const { data: user } = await supabase
-      .from('users')
-      .select('account_status')
-      .eq('id', user_id)
-      .maybeSingle();
-
+    const { data: user } = await supabase.from('users').select('account_status').eq('id', user_id).maybeSingle();
     if (!user) return res.status(404).json({ status: 'error', message: 'User not found' });
-    if (user.account_status !== 'suspended') {
-      return res.status(400).json({ status: 'error', message: 'Account is not suspended' });
-    }
+    if (user.account_status !== 'suspended') return res.status(400).json({ status: 'error', message: 'Account is not suspended' });
 
-    const { data: existing } = await supabase
-      .from('appeals')
-      .select('id')
-      .eq('user_id', user_id)
-      .eq('status', 'pending')
-      .maybeSingle();
-
-    if (existing) {
-      return res.status(400).json({ status: 'error', message: 'You already have a pending appeal' });
-    }
-
-    const { data: appeal, error } = await supabase
-      .from('appeals')
-      .insert({ user_id, appeal_text, status: 'pending' })
-      .select('id, created_at')
-      .single();
-
+    const { data: appeal, error } = await supabase.from('appeals').insert({ user_id, appeal_text, status: 'pending' }).select('id, created_at').single();
     if (error) throw error;
 
-    res.status(201).json({
-      status: 'ok',
-      message: 'Appeal submitted. We will review within 7 days.',
-      appeal
-    });
+    res.status(201).json({ status: 'ok', message: 'Appeal submitted.', appeal });
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message });
   }
@@ -349,15 +201,8 @@ app.post('/api/panic/appeal', async (req, res) => {
 
 app.get('/api/panic/status/:user_id', async (req, res) => {
   try {
-    const { user_id } = req.params;
-    const { data: user } = await supabase
-      .from('users')
-      .select('id, will_id, account_status, suspended_at, ban_deadline, banned_at, ban_reason')
-      .eq('id', user_id)
-      .maybeSingle();
-
+    const { data: user } = await supabase.from('users').select('id, will_id, account_status, suspended_at, ban_deadline, banned_at, ban_reason').eq('id', req.params.user_id).maybeSingle();
     if (!user) return res.status(404).json({ status: 'error', message: 'User not found' });
-
     res.json({ status: 'ok', user });
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message });
@@ -366,12 +211,7 @@ app.get('/api/panic/status/:user_id', async (req, res) => {
 
 app.get('/api/admin/panic/list', async (req, res) => {
   try {
-    const { data, error } = await supabase
-      .from('panic_reports')
-      .select('*')
-      .eq('status', 'open')
-      .order('created_at', { ascending: false });
-
+    const { data, error } = await supabase.from('panic_reports').select('*').eq('status', 'open').order('created_at', { ascending: false });
     if (error) throw error;
     res.json({ status: 'ok', count: data.length, reports: data });
   } catch (err) {
@@ -382,49 +222,179 @@ app.get('/api/admin/panic/list', async (req, res) => {
 app.post('/api/admin/panic/review', async (req, res) => {
   try {
     const { user_id, decision, notes } = req.body;
-
-    if (!user_id || !decision) {
-      return res.status(400).json({ status: 'error', message: 'user_id and decision required' });
-    }
+    if (!user_id || !decision) return res.status(400).json({ status: 'error', message: 'user_id and decision required' });
 
     if (decision === 'release') {
-      await supabase.from('users').update({
-        account_status: 'active',
-        suspended_at: null,
-        ban_deadline: null
-      }).eq('id', user_id);
-
-      await supabase.from('freeze_status').update({
-        is_frozen: false,
-        decision: 'released',
-        decided_at: new Date().toISOString(),
-        decided_by: 'admin',
-        decision_notes: notes || null
-      }).eq('target_user_id', user_id);
+      await supabase.from('users').update({ account_status: 'active', suspended_at: null, ban_deadline: null }).eq('id', user_id);
+      await supabase.from('freeze_status').update({ is_frozen: false, decision: 'released', decided_at: new Date().toISOString(), decided_by: 'admin', decision_notes: notes || null }).eq('target_user_id', user_id);
     } else if (decision === 'ban') {
-      await supabase.from('users').update({
-        account_status: 'banned',
-        banned_at: new Date().toISOString(),
-        ban_reason: notes || 'Community guidelines violation'
-      }).eq('id', user_id);
-
-      await supabase.from('freeze_status').update({
-        is_frozen: true,
-        decision: 'banned',
-        decided_at: new Date().toISOString(),
-        decided_by: 'admin',
-        decision_notes: notes || null
-      }).eq('target_user_id', user_id);
+      await supabase.from('users').update({ account_status: 'banned', banned_at: new Date().toISOString(), ban_reason: notes || 'Community guidelines violation' }).eq('id', user_id);
+      await supabase.from('freeze_status').update({ is_frozen: true, decision: 'banned', decided_at: new Date().toISOString(), decided_by: 'admin', decision_notes: notes || null }).eq('target_user_id', user_id);
     } else {
       return res.status(400).json({ status: 'error', message: 'decision must be release or ban' });
     }
 
-    await supabase.from('panic_reports').update({
-      status: 'resolved',
-      resolved_at: new Date().toISOString()
-    }).eq('target_user_id', user_id).eq('status', 'open');
-
+    await supabase.from('panic_reports').update({ status: 'resolved', resolved_at: new Date().toISOString() }).eq('target_user_id', user_id).eq('status', 'open');
     res.json({ status: 'ok', message: 'Decision applied: ' + decision });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.post('/api/videos', async (req, res) => {
+  try {
+    const { user_id, video_url, thumbnail_url, caption, duration_seconds, aspect_ratio, orientation, content_type, video_hash, is_duet, parent_video_id } = req.body;
+
+    if (!user_id || !video_url) return res.status(400).json({ status: 'error', message: 'user_id and video_url required' });
+
+    const { data: user } = await supabase.from('users').select('account_status').eq('id', user_id).maybeSingle();
+    if (!user) return res.status(404).json({ status: 'error', message: 'User not found' });
+    if (user.account_status !== 'active') return res.status(403).json({ status: 'error', message: 'Account is not active' });
+
+    if (content_type === 'short' && duration_seconds > 60) {
+      return res.status(400).json({ status: 'error', message: 'Short videos must be 60 seconds or less' });
+    }
+    if (content_type === 'long' && duration_seconds > 1500) {
+      return res.status(400).json({ status: 'error', message: 'Long videos must be 25 minutes or less' });
+    }
+
+    if (video_hash) {
+      const { data: existingVideo } = await supabase.from('videos').select('id').eq('video_hash', video_hash).maybeSingle();
+      if (existingVideo) return res.status(400).json({ status: 'error', message: 'This video already exists on WETIN' });
+    }
+
+    if (is_duet && parent_video_id) {
+      const { data: parent } = await supabase.from('videos').select('id, allow_duets, user_id').eq('id', parent_video_id).maybeSingle();
+      if (!parent) return res.status(404).json({ status: 'error', message: 'Original video not found' });
+      if (!parent.allow_duets) return res.status(403).json({ status: 'error', message: 'Duets are not allowed on this video' });
+
+      const { data: approval } = await supabase.from('duet_requests').select('status').eq('requester_id', user_id).eq('original_video_id', parent_video_id).maybeSingle();
+      if (!approval || approval.status !== 'approved') {
+        return res.status(403).json({ status: 'error', message: 'You need approval from the original creator' });
+      }
+    }
+
+    const { data: newVideo, error: insertErr } = await supabase.from('videos').insert({
+      user_id, video_url, thumbnail_url, caption, duration_sec: duration_seconds,
+      aspect_ratio: aspect_ratio || 'portrait', orientation: orientation || 'vertical',
+      content_type: content_type || 'short', video_hash, is_duet: is_duet || false,
+      parent_video_id: parent_video_id || null, moderation_flag: 'clean'
+    }).select('id, created_at').single();
+
+    if (insertErr) throw insertErr;
+
+    res.status(201).json({ status: 'ok', message: 'Video posted', video: newVideo });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message, details: err.details || null });
+  }
+});
+
+app.get('/api/videos/feed', async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 20;
+    const contentType = req.query.type || 'short';
+
+    let query = supabase.from('videos').select('id, user_id, video_url, thumbnail_url, caption, duration_sec, orientation, content_type, is_duet, parent_video_id, resonance_count, comment_count, created_at').eq('is_removed', false).eq('is_frozen', false).eq('moderation_flag', 'clean').order('created_at', { ascending: false }).limit(limit);
+
+    if (contentType !== 'all') {
+      query = query.eq('content_type', contentType);
+    }
+
+    const { data: videos, error } = await query;
+    if (error) throw error;
+
+    const formattedVideos = [];
+    for (const video of videos) {
+      const { data: user } = await supabase.from('users').select('id, will_id, mode, display_name, real_name').eq('id', video.user_id).maybeSingle();
+      formattedVideos.push({ ...video, creator: formatUserForViewer(user) });
+    }
+
+    res.json({ status: 'ok', count: formattedVideos.length, videos: formattedVideos });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.get('/api/videos/:id', async (req, res) => {
+  try {
+    const { data: video, error } = await supabase.from('videos').select('*').eq('id', req.params.id).maybeSingle();
+    if (error) throw error;
+    if (!video) return res.status(404).json({ status: 'error', message: 'Video not found' });
+
+    const { data: user } = await supabase.from('users').select('id, will_id, mode, display_name, real_name').eq('id', video.user_id).maybeSingle();
+    res.json({ status: 'ok', video: { ...video, creator: formatUserForViewer(user) } });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.post('/api/videos/:id/allow-duets', async (req, res) => {
+  try {
+    const { user_id, allow } = req.body;
+    const video_id = req.params.id;
+
+    if (!user_id || typeof allow !== 'boolean') return res.status(400).json({ status: 'error', message: 'user_id and allow (boolean) required' });
+
+    const { data: video } = await supabase.from('videos').select('user_id').eq('id', video_id).maybeSingle();
+    if (!video) return res.status(404).json({ status: 'error', message: 'Video not found' });
+    if (video.user_id !== user_id) return res.status(403).json({ status: 'error', message: 'Not your video' });
+
+    await supabase.from('videos').update({ allow_duets: allow }).eq('id', video_id);
+    res.json({ status: 'ok', message: allow ? 'Duets enabled' : 'Duets disabled', allow_duets: allow });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.post('/api/duet/request', async (req, res) => {
+  try {
+    const { requester_id, original_video_id, message } = req.body;
+    if (!requester_id || !original_video_id) return res.status(400).json({ status: 'error', message: 'requester_id and original_video_id required' });
+
+    const { data: video } = await supabase.from('videos').select('user_id, allow_duets').eq('id', original_video_id).maybeSingle();
+    if (!video) return res.status(404).json({ status: 'error', message: 'Video not found' });
+    if (!video.allow_duets) return res.status(403).json({ status: 'error', message: 'Duets are not allowed on this video' });
+    if (video.user_id === requester_id) return res.status(400).json({ status: 'error', message: 'Cannot duet your own video' });
+
+    const { data: existing } = await supabase.from('duet_requests').select('id, status').eq('requester_id', requester_id).eq('original_video_id', original_video_id).maybeSingle();
+    if (existing) return res.status(400).json({ status: 'error', message: 'Request already exists', current_status: existing.status });
+
+    const expires_at = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+
+    const { data: request, error } = await supabase.from('duet_requests').insert({ requester_id, original_video_id, original_creator_id: video.user_id, message: message || null, expires_at }).select('id, created_at, expires_at').single();
+
+    if (error) throw error;
+    res.status(201).json({ status: 'ok', message: 'Duet request sent', request });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.get('/api/duet/requests/:user_id', async (req, res) => {
+  try {
+    const { data: requests, error } = await supabase.from('duet_requests').select('*').eq('original_creator_id', req.params.user_id).eq('status', 'pending').order('requested_at', { ascending: false });
+    if (error) throw error;
+    res.json({ status: 'ok', count: requests.length, requests });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.post('/api/duet/respond', async (req, res) => {
+  try {
+    const { request_id, user_id, decision } = req.body;
+    if (!request_id || !user_id || !decision) return res.status(400).json({ status: 'error', message: 'request_id, user_id, decision required' });
+    if (decision !== 'approve' && decision !== 'deny') return res.status(400).json({ status: 'error', message: 'decision must be approve or deny' });
+
+    const { data: request } = await supabase.from('duet_requests').select('*').eq('id', request_id).maybeSingle();
+    if (!request) return res.status(404).json({ status: 'error', message: 'Request not found' });
+    if (request.original_creator_id !== user_id) return res.status(403).json({ status: 'error', message: 'Not your video' });
+    if (request.status !== 'pending') return res.status(400).json({ status: 'error', message: 'Request already ' + request.status });
+
+    const newStatus = decision === 'approve' ? 'approved' : 'denied';
+    await supabase.from('duet_requests').update({ status: newStatus, responded_at: new Date().toISOString() }).eq('id', request_id);
+
+    res.json({ status: 'ok', message: 'Duet ' + newStatus, decision: newStatus });
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message });
   }
