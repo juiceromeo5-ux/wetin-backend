@@ -7,6 +7,14 @@ const cloudinary = require('cloudinary').v2;
 const app = express();
 app.use(express.json());
 
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
+
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_KEY
@@ -161,7 +169,7 @@ app.post('/api/auth/claim-id', async (req, res) => {
 app.get('/api/users/search', async (req, res) => {
   try {
     const { q, user_id } = req.query;
-    if (!q || q.length < 2) return res.status(400).json({ status: 'error', message: 'Search query must be at least 2 characters' });
+    if (!q || q.length < 2) return res.status(400).json({ status: 'error', message: 'Query min 2 chars' });
 
     const { data: users, error } = await supabase.from('users')
       .select('id, will_id, mode, display_name, real_name')
@@ -171,12 +179,7 @@ app.get('/api/users/search', async (req, res) => {
       .limit(20);
 
     if (error) throw error;
-
-    const results = (users || []).filter(u => u.id !== user_id).map(u => ({
-      ...formatUserForViewer(u),
-      user_id: u.id
-    }));
-
+    const results = (users || []).filter(u => u.id !== user_id).map(u => ({ ...formatUserForViewer(u), user_id: u.id }));
     res.json({ status: 'ok', count: results.length, results });
   } catch (err) { res.status(500).json({ status: 'error', message: err.message }); }
 });
@@ -196,10 +199,8 @@ app.post('/api/chats/start', async (req, res) => {
 
     const { data: existing } = await supabase.from('chats').select('id, is_locked, expires_ui_at').or(`and(user_a_id.eq.${initiator_id},user_b_id.eq.${target_id}),and(user_a_id.eq.${target_id},user_b_id.eq.${initiator_id})`).maybeSingle();
 
-    if (existing) {
-      if (new Date(existing.expires_ui_at) > new Date()) {
-        return res.json({ status: 'ok', message: 'Chat already exists', chat_id: existing.id, existing: true });
-      }
+    if (existing && new Date(existing.expires_ui_at) > new Date()) {
+      return res.json({ status: 'ok', message: 'Chat already exists', chat_id: existing.id, existing: true });
     }
 
     const now = new Date();
@@ -207,14 +208,10 @@ app.post('/api/chats/start', async (req, res) => {
     const expires_backend_at = new Date(now.getTime() + 170 * 24 * 60 * 60 * 1000).toISOString();
 
     const { data: chat, error } = await supabase.from('chats').insert({
-      user_a_id: initiator_id,
-      user_b_id: target_id,
+      user_a_id: initiator_id, user_b_id: target_id,
       source_video_id: source_type === 'video' ? source_id : null,
-      initiator_id,
-      is_locked: true,
-      consecutive_initiator_msgs: 0,
-      expires_ui_at,
-      expires_backend_at
+      initiator_id, is_locked: true, consecutive_initiator_msgs: 0,
+      expires_ui_at, expires_backend_at
     }).select('id, created_at, expires_ui_at').single();
 
     if (error) throw error;
@@ -235,12 +232,10 @@ app.get('/api/chats', async (req, res) => {
       .limit(100);
 
     if (error) throw error;
-
     const formatted = [];
     for (const chat of chats) {
       const other_id = chat.user_a_id === user_id ? chat.user_b_id : chat.user_a_id;
       const { data: otherUser } = await supabase.from('users').select('id, will_id, mode, display_name, real_name').eq('id', other_id).maybeSingle();
-
       const { data: lastMsg } = await supabase.from('messages').select('content_encrypted, message_type, created_at, sender_id').eq('chat_id', chat.id).order('created_at', { ascending: false }).limit(1).maybeSingle();
 
       formatted.push({
@@ -250,14 +245,13 @@ app.get('/api/chats', async (req, res) => {
         allow_screenshots: chat.allow_screenshots,
         expires_at: chat.expires_ui_at,
         last_message: lastMsg ? {
-          preview: lastMsg.message_type === 'system' ? lastMsg.content_encrypted : decryptMessage(lastMsg.content_encrypted),
+          preview: lastMsg.message_type === 'system_screenshot' ? lastMsg.content_encrypted : decryptMessage(lastMsg.content_encrypted),
           type: lastMsg.message_type,
           created_at: lastMsg.created_at,
           from_me: lastMsg.sender_id === user_id
         } : null
       });
     }
-
     res.json({ status: 'ok', count: formatted.length, chats: formatted });
   } catch (err) { res.status(500).json({ status: 'error', message: err.message }); }
 });
@@ -270,40 +264,20 @@ app.get('/api/chats/:id/messages', async (req, res) => {
 
     const { data: chat } = await supabase.from('chats').select('*').eq('id', chat_id).maybeSingle();
     if (!chat) return res.status(404).json({ status: 'error', message: 'Chat not found' });
+    if (chat.user_a_id !== user_id && chat.user_b_id !== user_id) return res.status(403).json({ status: 'error', message: 'Not your chat' });
 
-    if (chat.user_a_id !== user_id && chat.user_b_id !== user_id) {
-      return res.status(403).json({ status: 'error', message: 'Not your chat' });
-    }
-
-    const now = new Date();
-    const expiresUi = new Date(chat.expires_ui_at);
-    const isExpired = now > expiresUi;
-
-    if (isExpired) {
-      return res.json({ status: 'ok', expired: true, messages: [] });
-    }
+    if (new Date(chat.expires_ui_at) < new Date()) return res.json({ status: 'ok', expired: true, messages: [] });
 
     const { data: messages, error } = await supabase.from('messages').select('id, sender_id, content_encrypted, message_type, created_at').eq('chat_id', chat_id).order('created_at', { ascending: true }).limit(500);
     if (error) throw error;
 
     const formatted = messages.map(m => ({
-      id: m.id,
-      from_me: m.sender_id === user_id,
-      sender_id: m.sender_id,
-      content: m.message_type === 'system' ? m.content_encrypted : decryptMessage(m.content_encrypted),
-      type: m.message_type,
-      created_at: m.created_at
+      id: m.id, from_me: m.sender_id === user_id, sender_id: m.sender_id,
+      content: m.message_type.startsWith('system') ? m.content_encrypted : decryptMessage(m.content_encrypted),
+      type: m.message_type, created_at: m.created_at
     }));
 
-    res.json({
-      status: 'ok',
-      expired: false,
-      is_locked: chat.is_locked,
-      allow_screenshots: chat.allow_screenshots,
-      expires_at: chat.expires_ui_at,
-      count: formatted.length,
-      messages: formatted
-    });
+    res.json({ status: 'ok', expired: false, is_locked: chat.is_locked, allow_screenshots: chat.allow_screenshots, expires_at: chat.expires_ui_at, count: formatted.length, messages: formatted });
   } catch (err) { res.status(500).json({ status: 'error', message: err.message }); }
 });
 
@@ -312,18 +286,16 @@ app.post('/api/chats/:id/messages', async (req, res) => {
     const { sender_id, content } = req.body;
     const chat_id = req.params.id;
     if (!sender_id || !content) return res.status(400).json({ status: 'error', message: 'sender_id and content required' });
-    if (content.length > 2000) return res.status(400).json({ status: 'error', message: 'Message too long (max 2000)' });
+    if (content.length > 2000) return res.status(400).json({ status: 'error', message: 'Message too long' });
 
     const { data: chat } = await supabase.from('chats').select('*').eq('id', chat_id).maybeSingle();
     if (!chat) return res.status(404).json({ status: 'error', message: 'Chat not found' });
     if (chat.user_a_id !== sender_id && chat.user_b_id !== sender_id) return res.status(403).json({ status: 'error', message: 'Not your chat' });
-    if (chat.frozen) return res.status(403).json({ status: 'error', message: 'This chat is frozen due to a report' });
-    if (new Date(chat.expires_ui_at) < new Date()) return res.status(400).json({ status: 'error', message: 'Chat has expired' });
+    if (chat.frozen) return res.status(403).json({ status: 'error', message: 'Chat is frozen' });
+    if (new Date(chat.expires_ui_at) < new Date()) return res.status(400).json({ status: 'error', message: 'Chat expired' });
 
-    if (chat.is_locked) {
-      if (sender_id === chat.initiator_id && chat.consecutive_initiator_msgs >= 3) {
-        return res.status(429).json({ status: 'error', message: 'Wait for a reply before sending more messages', locked: true });
-      }
+    if (chat.is_locked && sender_id === chat.initiator_id && chat.consecutive_initiator_msgs >= 3) {
+      return res.status(429).json({ status: 'error', message: 'Wait for a reply before sending more messages', locked: true });
     }
 
     const encrypted = encryptMessage(content);
@@ -331,12 +303,8 @@ app.post('/api/chats/:id/messages', async (req, res) => {
     if (error) throw error;
 
     const updates = {};
-    if (sender_id === chat.initiator_id) {
-      updates.consecutive_initiator_msgs = (chat.consecutive_initiator_msgs || 0) + 1;
-    } else {
-      updates.consecutive_initiator_msgs = 0;
-      updates.is_locked = false;
-    }
+    if (sender_id === chat.initiator_id) updates.consecutive_initiator_msgs = (chat.consecutive_initiator_msgs || 0) + 1;
+    else { updates.consecutive_initiator_msgs = 0; updates.is_locked = false; }
     await supabase.from('chats').update(updates).eq('id', chat_id);
 
     res.status(201).json({ status: 'ok', message: 'Message sent', message_id: message.id, created_at: message.created_at });
@@ -353,13 +321,10 @@ app.post('/api/chats/:id/screenshot', async (req, res) => {
     if (!chat) return res.status(404).json({ status: 'error', message: 'Chat not found' });
     if (chat.user_a_id !== user_id && chat.user_b_id !== user_id) return res.status(403).json({ status: 'error', message: 'Not your chat' });
 
-    if (chat.allow_screenshots) {
-      return res.json({ status: 'ok', silent: true });
-    }
+    if (chat.allow_screenshots) return res.json({ status: 'ok', silent: true });
 
     const other_id = chat.user_a_id === user_id ? chat.user_b_id : chat.user_a_id;
     const { data: user } = await supabase.from('users').select('will_id').eq('id', user_id).maybeSingle();
-
     const alertText = '📸 ' + (user ? '@' + user.will_id : 'Someone') + ' took a screenshot';
     await supabase.from('messages').insert({ chat_id, sender_id: user_id, content_encrypted: alertText, message_type: 'system_screenshot' });
 
@@ -371,7 +336,7 @@ app.post('/api/chats/:id/toggle-screenshots', async (req, res) => {
   try {
     const { user_id, allow } = req.body;
     const chat_id = req.params.id;
-    if (!user_id || typeof allow !== 'boolean') return res.status(400).json({ status: 'error', message: 'user_id and allow (boolean) required' });
+    if (!user_id || typeof allow !== 'boolean') return res.status(400).json({ status: 'error', message: 'user_id and allow required' });
 
     const { data: chat } = await supabase.from('chats').select('*').eq('id', chat_id).maybeSingle();
     if (!chat) return res.status(404).json({ status: 'error', message: 'Chat not found' });
@@ -394,23 +359,9 @@ app.post('/api/chats/:id/report', async (req, res) => {
 
     const other_id = chat.user_a_id === reporter_id ? chat.user_b_id : chat.user_a_id;
 
-    await supabase.from('panic_reports').insert({
-      reporter_id,
-      target_type: 'chat',
-      target_id: chat_id,
-      target_user_id: other_id,
-      context: 'chat',
-      notes: reason || null,
-      status: 'open'
-    });
-
+    await supabase.from('panic_reports').insert({ reporter_id, target_type: 'chat', target_id: chat_id, target_user_id: other_id, context: 'chat', notes: reason || null, status: 'open' });
     await supabase.from('chats').update({ reported: true, frozen: true }).eq('id', chat_id);
-
-    await supabase.from('users').update({
-      account_status: 'suspended',
-      suspended_at: new Date().toISOString(),
-      ban_deadline: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString()
-    }).eq('id', other_id);
+    await supabase.from('users').update({ account_status: 'suspended', suspended_at: new Date().toISOString(), ban_deadline: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString() }).eq('id', other_id);
 
     res.json({ status: 'ok', message: 'Chat reported. Frozen for review.', frozen_user: other_id });
   } catch (err) { res.status(500).json({ status: 'error', message: err.message }); }
@@ -419,7 +370,7 @@ app.post('/api/chats/:id/report', async (req, res) => {
 app.post('/api/panic/report', async (req, res) => {
   try {
     const { reporter_id, target_type, target_id, target_user_id, context, notes } = req.body;
-    if (!reporter_id || !target_type || !target_id) return res.status(400).json({ status: 'error', message: 'reporter_id, target_type, target_id required' });
+    if (!reporter_id || !target_type || !target_id) return res.status(400).json({ status: 'error', message: 'Missing fields' });
 
     const { data: existing } = await supabase.from('panic_reports').select('id').eq('reporter_id', reporter_id).eq('target_type', target_type).eq('target_id', target_id).maybeSingle();
     if (existing) return res.status(400).json({ status: 'error', message: 'You already reported this' });
@@ -448,10 +399,10 @@ app.post('/api/panic/report', async (req, res) => {
 app.post('/api/panic/appeal', async (req, res) => {
   try {
     const { user_id, appeal_text } = req.body;
-    if (!user_id || !appeal_text) return res.status(400).json({ status: 'error', message: 'user_id and appeal_text required' });
+    if (!user_id || !appeal_text) return res.status(400).json({ status: 'error', message: 'Missing fields' });
     const { data: user } = await supabase.from('users').select('account_status').eq('id', user_id).maybeSingle();
     if (!user) return res.status(404).json({ status: 'error', message: 'User not found' });
-    if (user.account_status !== 'suspended') return res.status(400).json({ status: 'error', message: 'Account is not suspended' });
+    if (user.account_status !== 'suspended') return res.status(400).json({ status: 'error', message: 'Not suspended' });
 
     const { data: appeal, error } = await supabase.from('appeals').insert({ user_id, appeal_text, status: 'pending' }).select('id, created_at').single();
     if (error) throw error;
@@ -478,13 +429,13 @@ app.get('/api/admin/panic/list', async (req, res) => {
 app.post('/api/admin/panic/review', async (req, res) => {
   try {
     const { user_id, decision, notes } = req.body;
-    if (!user_id || !decision) return res.status(400).json({ status: 'error', message: 'user_id and decision required' });
+    if (!user_id || !decision) return res.status(400).json({ status: 'error', message: 'Missing fields' });
 
     if (decision === 'release') {
       await supabase.from('users').update({ account_status: 'active', suspended_at: null, ban_deadline: null }).eq('id', user_id);
       await supabase.from('freeze_status').update({ is_frozen: false, decision: 'released', decided_at: new Date().toISOString(), decided_by: 'admin', decision_notes: notes || null }).eq('target_user_id', user_id);
     } else if (decision === 'ban') {
-      await supabase.from('users').update({ account_status: 'banned', banned_at: new Date().toISOString(), ban_reason: notes || 'Community guidelines violation' }).eq('id', user_id);
+      await supabase.from('users').update({ account_status: 'banned', banned_at: new Date().toISOString(), ban_reason: notes || 'Violation' }).eq('id', user_id);
       await supabase.from('freeze_status').update({ is_frozen: true, decision: 'banned', decided_at: new Date().toISOString(), decided_by: 'admin', decision_notes: notes || null }).eq('target_user_id', user_id);
     } else return res.status(400).json({ status: 'error', message: 'decision must be release or ban' });
 
@@ -498,7 +449,7 @@ app.post('/api/upload/sign', async (req, res) => {
     const { user_id, content_type } = req.body;
     if (!user_id) return res.status(400).json({ status: 'error', message: 'user_id required' });
     const { data: user } = await supabase.from('users').select('account_status').eq('id', user_id).maybeSingle();
-    if (!user || user.account_status !== 'active') return res.status(403).json({ status: 'error', message: 'Account is not active' });
+    if (!user || user.account_status !== 'active') return res.status(403).json({ status: 'error', message: 'Account not active' });
 
     const timestamp = Math.round(Date.now() / 1000);
     const folder = content_type === 'long' ? 'wetin/long' : 'wetin/short';
@@ -514,23 +465,22 @@ app.post('/api/videos', async (req, res) => {
     if (!user_id || !video_url) return res.status(400).json({ status: 'error', message: 'user_id and video_url required' });
 
     const { data: user } = await supabase.from('users').select('account_status').eq('id', user_id).maybeSingle();
-    if (!user) return res.status(404).json({ status: 'error', message: 'User not found' });
-    if (user.account_status !== 'active') return res.status(403).json({ status: 'error', message: 'Account is not active' });
+    if (!user || user.account_status !== 'active') return res.status(403).json({ status: 'error', message: 'Account not active' });
 
-    if (content_type === 'short' && duration_seconds > 60) return res.status(400).json({ status: 'error', message: 'Short videos must be ≤ 60 seconds' });
-    if (content_type === 'long' && duration_seconds > 1500) return res.status(400).json({ status: 'error', message: 'Long videos must be ≤ 25 minutes' });
+    if (content_type === 'short' && duration_seconds > 60) return res.status(400).json({ status: 'error', message: 'Short videos must be ≤ 60s' });
+    if (content_type === 'long' && duration_seconds > 1500) return res.status(400).json({ status: 'error', message: 'Long videos must be ≤ 25 min' });
 
     if (video_hash) {
       const { data: existingVideo } = await supabase.from('videos').select('id').eq('video_hash', video_hash).maybeSingle();
-      if (existingVideo) return res.status(400).json({ status: 'error', message: 'This video already exists' });
+      if (existingVideo) return res.status(400).json({ status: 'error', message: 'Video already exists' });
     }
 
     if (is_duet && parent_video_id) {
       const { data: parent } = await supabase.from('videos').select('id, allow_duets, user_id').eq('id', parent_video_id).maybeSingle();
-      if (!parent) return res.status(404).json({ status: 'error', message: 'Original video not found' });
+      if (!parent) return res.status(404).json({ status: 'error', message: 'Original not found' });
       if (!parent.allow_duets) return res.status(403).json({ status: 'error', message: 'Duets not allowed' });
       const { data: approval } = await supabase.from('duet_requests').select('status').eq('requester_id', user_id).eq('original_video_id', parent_video_id).maybeSingle();
-      if (!approval || approval.status !== 'approved') return res.status(403).json({ status: 'error', message: 'Need creator approval' });
+      if (!approval || approval.status !== 'approved') return res.status(403).json({ status: 'error', message: 'Need approval' });
     }
 
     const { data: newVideo, error: insertErr } = await supabase.from('videos').insert({
@@ -561,7 +511,6 @@ app.get('/api/videos/feed', async (req, res) => {
       const { data: user } = await supabase.from('users').select('id, will_id, mode, display_name, real_name').eq('id', video.user_id).maybeSingle();
       formattedVideos.push({ ...video, creator: formatUserForViewer(user) });
     }
-
     res.json({ status: 'ok', count: formattedVideos.length, videos: formattedVideos });
   } catch (err) { res.status(500).json({ status: 'error', message: err.message }); }
 });
@@ -587,8 +536,8 @@ app.get('/api/videos/:id/stats', async (req, res) => {
 app.post('/api/comments', async (req, res) => {
   try {
     const { user_id, video_id, content, parent_id } = req.body;
-    if (!user_id || !video_id || !content) return res.status(400).json({ status: 'error', message: 'user_id, video_id, content required' });
-    if (content.length > 500) return res.status(400).json({ status: 'error', message: 'Comment too long' });
+    if (!user_id || !video_id || !content) return res.status(400).json({ status: 'error', message: 'Missing fields' });
+    if (content.length > 500) return res.status(400).json({ status: 'error', message: 'Too long' });
 
     const { data: user } = await supabase.from('users').select('account_status').eq('id', user_id).maybeSingle();
     if (!user || user.account_status !== 'active') return res.status(403).json({ status: 'error', message: 'Account not active' });
@@ -623,8 +572,8 @@ app.delete('/api/comments/:id', async (req, res) => {
     const { user_id } = req.body;
     if (!user_id) return res.status(400).json({ status: 'error', message: 'user_id required' });
     const { data: comment } = await supabase.from('comments').select('user_id').eq('id', req.params.id).maybeSingle();
-    if (!comment) return res.status(404).json({ status: 'error', message: 'Comment not found' });
-    if (comment.user_id !== user_id) return res.status(403).json({ status: 'error', message: 'Not your comment' });
+    if (!comment) return res.status(404).json({ status: 'error', message: 'Not found' });
+    if (comment.user_id !== user_id) return res.status(403).json({ status: 'error', message: 'Not yours' });
 
     await supabase.from('comments').update({ is_removed: true }).eq('id', req.params.id);
     res.json({ status: 'ok', message: 'Comment deleted' });
@@ -634,10 +583,10 @@ app.delete('/api/comments/:id', async (req, res) => {
 app.post('/api/resonance', async (req, res) => {
   try {
     const { user_id, video_id } = req.body;
-    if (!user_id || !video_id) return res.status(400).json({ status: 'error', message: 'user_id and video_id required' });
+    if (!user_id || !video_id) return res.status(400).json({ status: 'error', message: 'Missing fields' });
 
     const { data: user } = await supabase.from('users').select('account_status').eq('id', user_id).maybeSingle();
-    if (!user || user.account_status !== 'active') return res.status(403).json({ status: 'error', message: 'Account not active' });
+    if (!user || user.account_status !== 'active') return res.status(403).json({ status: 'error', message: 'Not active' });
 
     const { data: video } = await supabase.from('videos').select('id, resonance_count').eq('id', video_id).maybeSingle();
     if (!video) return res.status(404).json({ status: 'error', message: 'Video not found' });
@@ -668,11 +617,11 @@ app.get('/api/resonance/:video_id/:user_id', async (req, res) => {
 app.post('/api/follow', async (req, res) => {
   try {
     const { follower_id, following_id } = req.body;
-    if (!follower_id || !following_id) return res.status(400).json({ status: 'error', message: 'follower_id and following_id required' });
+    if (!follower_id || !following_id) return res.status(400).json({ status: 'error', message: 'Missing fields' });
     if (follower_id === following_id) return res.status(400).json({ status: 'error', message: 'Cannot follow yourself' });
 
     const { data: userA } = await supabase.from('users').select('id, account_status').eq('id', follower_id).maybeSingle();
-    if (!userA || userA.account_status !== 'active') return res.status(403).json({ status: 'error', message: 'Your account is not active' });
+    if (!userA || userA.account_status !== 'active') return res.status(403).json({ status: 'error', message: 'Not active' });
 
     const { data: userB } = await supabase.from('users').select('id').eq('id', following_id).maybeSingle();
     if (!userB) return res.status(404).json({ status: 'error', message: 'User not found' });
@@ -733,7 +682,7 @@ app.post('/api/videos/:id/allow-duets', async (req, res) => {
   try {
     const { user_id, allow } = req.body;
     const video_id = req.params.id;
-    if (!user_id || typeof allow !== 'boolean') return res.status(400).json({ status: 'error', message: 'user_id and allow (boolean) required' });
+    if (!user_id || typeof allow !== 'boolean') return res.status(400).json({ status: 'error', message: 'Missing fields' });
 
     const { data: video } = await supabase.from('videos').select('user_id').eq('id', video_id).maybeSingle();
     if (!video) return res.status(404).json({ status: 'error', message: 'Video not found' });
@@ -747,19 +696,18 @@ app.post('/api/videos/:id/allow-duets', async (req, res) => {
 app.post('/api/duet/request', async (req, res) => {
   try {
     const { requester_id, original_video_id, message } = req.body;
-    if (!requester_id || !original_video_id) return res.status(400).json({ status: 'error', message: 'requester_id and original_video_id required' });
+    if (!requester_id || !original_video_id) return res.status(400).json({ status: 'error', message: 'Missing fields' });
 
     const { data: video } = await supabase.from('videos').select('user_id, allow_duets').eq('id', original_video_id).maybeSingle();
     if (!video) return res.status(404).json({ status: 'error', message: 'Video not found' });
     if (!video.allow_duets) return res.status(403).json({ status: 'error', message: 'Duets not allowed' });
-    if (video.user_id === requester_id) return res.status(400).json({ status: 'error', message: 'Cannot duet your own video' });
+    if (video.user_id === requester_id) return res.status(400).json({ status: 'error', message: 'Cannot duet your own' });
 
     const { data: existing } = await supabase.from('duet_requests').select('id, status').eq('requester_id', requester_id).eq('original_video_id', original_video_id).maybeSingle();
-    if (existing) return res.status(400).json({ status: 'error', message: 'Request already exists', current_status: existing.status });
+    if (existing) return res.status(400).json({ status: 'error', message: 'Request exists', current_status: existing.status });
 
     const expires_at = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
     const { data: request, error } = await supabase.from('duet_requests').insert({ requester_id, original_video_id, original_creator_id: video.user_id, message: message || null, expires_at }).select('id, created_at, expires_at').single();
-
     if (error) throw error;
     res.status(201).json({ status: 'ok', message: 'Duet request sent', request });
   } catch (err) { res.status(500).json({ status: 'error', message: err.message }); }
@@ -776,13 +724,13 @@ app.get('/api/duet/requests/:user_id', async (req, res) => {
 app.post('/api/duet/respond', async (req, res) => {
   try {
     const { request_id, user_id, decision } = req.body;
-    if (!request_id || !user_id || !decision) return res.status(400).json({ status: 'error', message: 'request_id, user_id, decision required' });
+    if (!request_id || !user_id || !decision) return res.status(400).json({ status: 'error', message: 'Missing fields' });
     if (decision !== 'approve' && decision !== 'deny') return res.status(400).json({ status: 'error', message: 'decision must be approve or deny' });
 
     const { data: request } = await supabase.from('duet_requests').select('*').eq('id', request_id).maybeSingle();
-    if (!request) return res.status(404).json({ status: 'error', message: 'Request not found' });
+    if (!request) return res.status(404).json({ status: 'error', message: 'Not found' });
     if (request.original_creator_id !== user_id) return res.status(403).json({ status: 'error', message: 'Not your video' });
-    if (request.status !== 'pending') return res.status(400).json({ status: 'error', message: 'Request already ' + request.status });
+    if (request.status !== 'pending') return res.status(400).json({ status: 'error', message: 'Already ' + request.status });
 
     const newStatus = decision === 'approve' ? 'approved' : 'denied';
     await supabase.from('duet_requests').update({ status: newStatus, responded_at: new Date().toISOString() }).eq('id', request_id);
