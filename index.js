@@ -63,35 +63,19 @@ app.post('/api/auth/start', async (req, res) => {
     if (!email || !phone) return res.status(400).json({ status: 'error', message: 'Email and phone required' });
     if (!password || password.length < 6) return res.status(400).json({ status: 'error', message: 'Password must be at least 6 characters' });
     if (!terms_accepted || !privacy_accepted) return res.status(400).json({ status: 'error', message: 'Must accept Terms and Privacy' });
-
     const phone_hash = hashValue(phone);
     const email_hash = hashValue(email);
-
     const { data: phoneExists } = await supabase.from('users').select('id').eq('phone_hash', phone_hash).maybeSingle();
     if (phoneExists) return res.status(400).json({ status: 'error', message: 'Phone already registered' });
-
     const { count: emailCount } = await supabase.from('users').select('*', { count: 'exact', head: true }).eq('email_hash', email_hash);
     if (emailCount >= 4) return res.json({ status: 'limit_reached', message: 'Max 4 accounts per email' });
-
     const otp = generateOtp();
     const expires_at = new Date(Date.now() + 10 * 60 * 1000).toISOString();
-
-    await supabase.from('otp_codes').insert({
-      email_hash, phone_hash, code: otp, purpose: 'signup', expires_at,
-      password_hash: hashPassword(password),
-      full_name: full_name || null
-    });
-
+    await supabase.from('otp_codes').insert({ email_hash, phone_hash, code: otp, purpose: 'signup', expires_at, password_hash: hashPassword(password), full_name: full_name || null });
     let emailError = null;
     try {
-      await resend.emails.send({
-        from: process.env.RESEND_FROM || 'onboarding@resend.dev',
-        to: email,
-        subject: 'Your WETIN verification code',
-        html: '<div style="font-family:sans-serif;padding:24px;background:#0A0A0A;color:#F5F5F5;"><h1 style="color:#C6FF00;">WETIN</h1><p>Your verification code is:</p><h2 style="color:#C6FF00;font-size:32px;letter-spacing:4px;">' + otp + '</h2><p>Expires in 10 minutes.</p></div>'
-      });
+      await resend.emails.send({ from: process.env.RESEND_FROM || 'onboarding@resend.dev', to: email, subject: 'Your WETIN verification code', html: '<div style="font-family:sans-serif;padding:24px;background:#0A0A0A;color:#F5F5F5;"><h1 style="color:#C6FF00;">WETIN</h1><p>Your verification code is:</p><h2 style="color:#C6FF00;font-size:32px;letter-spacing:4px;">' + otp + '</h2><p>Expires in 10 minutes.</p></div>' });
     } catch (emailErr) { emailError = emailErr.message || String(emailErr); }
-
     res.json({ status: 'ok', message: emailError ? 'OTP generated but email failed' : 'Verification code sent', email_error: emailError });
   } catch (err) { res.status(500).json({ status: 'error', message: err.message }); }
 });
@@ -100,15 +84,11 @@ app.post('/api/auth/verify', async (req, res) => {
   try {
     const { email, phone, otp_code } = req.body;
     if (!email || !phone || !otp_code) return res.status(400).json({ status: 'error', message: 'Missing fields' });
-
     const phone_hash = hashValue(phone);
     const email_hash = hashValue(email);
-
     const { data: otpRecord } = await supabase.from('otp_codes').select('*').eq('email_hash', email_hash).eq('code', otp_code).eq('used', false).gte('expires_at', new Date().toISOString()).order('created_at', { ascending: false }).limit(1).maybeSingle();
     if (!otpRecord) return res.status(400).json({ status: 'error', message: 'Invalid or expired OTP' });
-
     await supabase.from('otp_codes').update({ used: true }).eq('id', otpRecord.id);
-
     let will_id; let attempts = 0;
     while (attempts < 5) {
       will_id = generateWillId();
@@ -116,15 +96,12 @@ app.post('/api/auth/verify', async (req, res) => {
       if (!clash) break;
       attempts++;
     }
-
     const { data: newUser, error: createErr } = await supabase.from('users').insert({
       will_id, phone_hash, email_hash, phone_verified: true, email_verified: true, mode: 'ghost', kyc_verified: false,
       signup_completed: false, will_id_locked: false, terms_accepted: true, terms_accepted_at: new Date().toISOString(),
       privacy_accepted: true, privacy_accepted_at: new Date().toISOString(), subscription_tier: 'free', account_status: 'active',
-      password_hash: otpRecord.password_hash || null,
-      full_name: otpRecord.full_name || null
+      password_hash: otpRecord.password_hash || null, full_name: otpRecord.full_name || null
     }).select('id, will_id').single();
-
     if (createErr) throw createErr;
     res.status(201).json({ status: 'ok', user_id: newUser.id, default_will_id: newUser.will_id });
   } catch (err) { res.status(500).json({ status: 'error', message: err.message, details: err.details || null }); }
@@ -150,7 +127,6 @@ app.post('/api/auth/claim-id', async (req, res) => {
     if (!user_id || !will_id) return res.status(400).json({ status: 'error', message: 'Missing fields' });
     const { data: clash } = await supabase.from('users').select('id').eq('will_id', will_id).maybeSingle();
     if (clash) return res.status(400).json({ status: 'error', message: 'Will ID taken' });
-
     const { data: updated, error } = await supabase.from('users').update({ will_id, will_id_locked: true, signup_completed: true }).eq('id', user_id).select('id, will_id, mode, created_at').single();
     if (error) throw error;
     res.json({ status: 'ok', message: 'Welcome to WETIN', user: updated });
@@ -172,14 +148,11 @@ app.post('/api/chats/start', async (req, res) => {
     const { initiator_id, target_id } = req.body;
     if (!initiator_id || !target_id) return res.status(400).json({ status: 'error', message: 'Missing fields' });
     if (initiator_id === target_id) return res.status(400).json({ status: 'error', message: 'Cannot chat with yourself' });
-
     const { data: existing } = await supabase.from('chats').select('id, expires_ui_at').or(`and(user_a_id.eq.${initiator_id},user_b_id.eq.${target_id}),and(user_a_id.eq.${target_id},user_b_id.eq.${initiator_id})`).maybeSingle();
     if (existing && new Date(existing.expires_ui_at) > new Date()) return res.json({ status: 'ok', chat_id: existing.id, existing: true });
-
     const now = new Date();
     const expires_ui_at = new Date(now.getTime() + 14 * 86400000).toISOString();
     const expires_backend_at = new Date(now.getTime() + 170 * 86400000).toISOString();
-
     const { data: chat, error } = await supabase.from('chats').insert({ user_a_id: initiator_id, user_b_id: target_id, initiator_id, is_locked: true, consecutive_initiator_msgs: 0, expires_ui_at, expires_backend_at }).select('id, created_at, expires_ui_at').single();
     if (error) throw error;
     res.status(201).json({ status: 'ok', chat });
@@ -209,7 +182,6 @@ app.get('/api/chats/:id/messages', async (req, res) => {
     if (!chat) return res.status(404).json({ status: 'error', message: 'Chat not found' });
     if (chat.user_a_id !== user_id && chat.user_b_id !== user_id) return res.status(403).json({ status: 'error', message: 'Not your chat' });
     if (new Date(chat.expires_ui_at) < new Date()) return res.json({ status: 'ok', expired: true, messages: [] });
-
     const { data: messages } = await supabase.from('messages').select('id, sender_id, content_encrypted, message_type, created_at').eq('chat_id', req.params.id).order('created_at', { ascending: true }).limit(500);
     const formatted = (messages || []).map(m => ({ id: m.id, from_me: m.sender_id === user_id, content: m.message_type.startsWith('system') ? m.content_encrypted : decryptMessage(m.content_encrypted), type: m.message_type, created_at: m.created_at }));
     res.json({ status: 'ok', is_locked: chat.is_locked, count: formatted.length, messages: formatted });
@@ -225,10 +197,8 @@ app.post('/api/chats/:id/messages', async (req, res) => {
     if (chat.user_a_id !== sender_id && chat.user_b_id !== sender_id) return res.status(403).json({ status: 'error', message: 'Not your chat' });
     if (chat.frozen) return res.status(403).json({ status: 'error', message: 'Chat is frozen' });
     if (chat.is_locked && sender_id === chat.initiator_id && chat.consecutive_initiator_msgs >= 3) return res.status(429).json({ status: 'error', message: 'Wait for a reply' });
-
     const encrypted = encryptMessage(content);
     const { data: message } = await supabase.from('messages').insert({ chat_id: req.params.id, sender_id, content_encrypted: encrypted, message_type: 'text' }).select('id, created_at').single();
-
     const updates = {};
     if (sender_id === chat.initiator_id) updates.consecutive_initiator_msgs = (chat.consecutive_initiator_msgs || 0) + 1;
     else { updates.consecutive_initiator_msgs = 0; updates.is_locked = false; }
