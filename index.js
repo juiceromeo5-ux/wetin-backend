@@ -67,8 +67,7 @@ app.post('/api/auth/start', async (req, res) => {
     const email_hash = hashValue(email);
     const { data: phoneExists } = await supabase.from('users').select('id').eq('phone_hash', phone_hash).maybeSingle();
     if (phoneExists) return res.status(400).json({ status: 'error', message: 'Phone already registered' });
-    const { count: emailCount } = await supabase.from('users').select('*', { count: 'exact', head: true }).eq('email_hash', email_hash);
-    if (emailCount >= 4) return res.json({ status: 'limit_reached', message: 'Max 4 accounts per email' });
+    // Email limit removed for testing
     const otp = generateOtp();
     const expires_at = new Date(Date.now() + 10 * 60 * 1000).toISOString();
     await supabase.from('otp_codes').insert({ email_hash, phone_hash, code: otp, purpose: 'signup', expires_at, password_hash: hashPassword(password), full_name: full_name || null });
