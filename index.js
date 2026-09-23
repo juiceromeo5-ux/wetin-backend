@@ -67,7 +67,6 @@ app.post('/api/auth/start', async (req, res) => {
     const email_hash = hashValue(email);
     const { data: phoneExists } = await supabase.from('users').select('id').eq('phone_hash', phone_hash).maybeSingle();
     if (phoneExists) return res.status(400).json({ status: 'error', message: 'Phone already registered' });
-    // Email limit removed for testing
     const otp = generateOtp();
     const expires_at = new Date(Date.now() + 10 * 60 * 1000).toISOString();
     await supabase.from('otp_codes').insert({ email_hash, phone_hash, code: otp, purpose: 'signup', expires_at, password_hash: hashPassword(password), full_name: full_name || null });
@@ -106,17 +105,35 @@ app.post('/api/auth/verify', async (req, res) => {
   } catch (err) { res.status(500).json({ status: 'error', message: err.message, details: err.details || null }); }
 });
 
+// FIXED LOGIN — handles multiple accounts per email
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) return res.status(400).json({ status: 'error', message: 'Email and password required' });
     const email_hash = hashValue(email);
-    const { data: user } = await supabase.from('users').select('id, will_id, mode, display_name, password_hash, account_status, signup_completed').eq('email_hash', email_hash).maybeSingle();
-    if (!user) return res.status(400).json({ status: 'error', message: 'No account with that email' });
-    if (user.account_status === 'banned') return res.status(403).json({ status: 'error', message: 'Account banned' });
-    if (!user.password_hash) return res.status(400).json({ status: 'error', message: 'No password set. Use OTP signup.' });
-    if (!verifyPassword(password, user.password_hash)) return res.status(400).json({ status: 'error', message: 'Wrong password' });
-    res.json({ status: 'ok', user: { user_id: user.id, will_id: user.will_id, mode: user.mode, signup_completed: user.signup_completed } });
+
+    const { data: users, error } = await supabase
+      .from('users')
+      .select('id, will_id, mode, display_name, password_hash, account_status, signup_completed')
+      .eq('email_hash', email_hash);
+
+    if (error) throw error;
+    if (!users || users.length === 0) return res.status(400).json({ status: 'error', message: 'No account with this email' });
+
+    const matchedUser = users.find(u => u.password_hash && verifyPassword(password, u.password_hash));
+    if (!matchedUser) return res.status(400).json({ status: 'error', message: 'Wrong password' });
+    if (matchedUser.account_status === 'banned') return res.status(403).json({ status: 'error', message: 'Account banned' });
+
+    res.json({
+      status: 'ok',
+      user: {
+        user_id: matchedUser.id,
+        will_id: matchedUser.will_id,
+        mode: matchedUser.mode,
+        display_name: matchedUser.display_name,
+        signup_completed: matchedUser.signup_completed
+      }
+    });
   } catch (err) { res.status(500).json({ status: 'error', message: err.message }); }
 });
 
